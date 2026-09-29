@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
+import re
 import sys
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -16,29 +17,68 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("kufar_bot")
+logger = logging.getLogger("kufar_hunter")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "7805601948")
 WEB_PORT = int(os.getenv("PORT", 10000))
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 30))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 25))
 
 KUFAR_SEARCH_API_URL = "https://api.kufar.by/search-api/v1/search/rendered-paginated"
 
 DEFAULT_PARAMS: Dict[str, str] = {
-    "cat": "17010",          # Мобильные телефоны
-    "prc": "r:80,5000",      # Цена от 80 до 5000 BYN (отсекает копеечные аксессуары и шнуры)
-    "sort": "lst.d",         # Сортировка: самые новые первыми
-    "size": "30",            # Смотрим последние 30 объявлений
+    "cat": "17010",          # Телефоны
+    "sort": "lst.d",         # Новые первыми
+    "size": "30",            # 30 последних объявлений
 }
 
-# Минус-слова проверяем ТОЛЬКО В НАЗВАНИИ, чтобы не резать телефоны с чехлом/коробкой в комплекте
-TITLE_EXCLUDE_KEYWORDS: List[str] = [
-    "чехол", "чехлы", "бампер", "накладка",
-    "стекло", "пленка", "гидрогель",
-    "запчасти", "на запчасти", "донор", "под восстановление",
-    "дисплей", "экран", "матрица", "корпус",
-    "коробка от", "пустая коробка"
+# ---------------------------------------------------------------------------
+# МАТРИЦА ОХОТЫ ЗА СЛАДКИМИ ЦЕНАМИ (в рублях BYN)
+# Формат: регулярка для поиска модели -> (Макс. цена входа, Примерный рынок)
+# ---------------------------------------------------------------------------
+PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
+    # iPhone
+    (re.compile(r"\b15\s*pro\s*max\b", re.I), "iPhone 15 Pro Max", 1900, 3100),
+    (re.compile(r"\b15\s*pro\b", re.I), "iPhone 15 Pro", 1600, 2600),
+    (re.compile(r"\b15\s*plus\b", re.I), "iPhone 15 Plus", 1300, 2200),
+    (re.compile(r"\biphone\s*15\b|\bайфон\s*15\b", re.I), "iPhone 15", 1200, 2000),
+
+    (re.compile(r"\b14\s*pro\s*max\b", re.I), "iPhone 14 Pro Max", 1500, 2500),
+    (re.compile(r"\b14\s*pro\b", re.I), "iPhone 14 Pro", 1300, 2100),
+    (re.compile(r"\b14\s*plus\b", re.I), "iPhone 14 Plus", 1000, 1700),
+    (re.compile(r"\biphone\s*14\b|\bайфон\s*14\b", re.I), "iPhone 14", 950, 1600),
+
+    (re.compile(r"\b13\s*pro\s*max\b", re.I), "iPhone 13 Pro Max", 1200, 1900),
+    (re.compile(r"\b13\s*pro\b", re.I), "iPhone 13 Pro", 950, 1600),
+    (re.compile(r"\b13\s*mini\b", re.I), "iPhone 13 mini", 650, 1200),
+    (re.compile(r"\biphone\s*13\b|\bайфон\s*13\b", re.I), "iPhone 13", 750, 1350),
+
+    (re.compile(r"\b12\s*pro\s*max\b", re.I), "iPhone 12 Pro Max", 800, 1400),
+    (re.compile(r"\b12\s*pro\b", re.I), "iPhone 12 Pro", 650, 1200),
+    (re.compile(r"\b12\s*mini\b", re.I), "iPhone 12 mini", 400, 800),
+    (re.compile(r"\biphone\s*12\b|\bайфон\s*12\b", re.I), "iPhone 12", 500, 950),
+
+    (re.compile(r"\b11\s*pro\s*max\b", re.I), "iPhone 11 Pro Max", 550, 950),
+    (re.compile(r"\b11\s*pro\b", re.I), "iPhone 11 Pro", 450, 800),
+    (re.compile(r"\biphone\s*11\b|\bайфон\s*11\b", re.I), "iPhone 11", 350, 650),
+
+    (re.compile(r"\b(iphone\s*)?(xr|xs\s*max|xs)\b", re.I), "iPhone XR/XS", 250, 480),
+
+    # Samsung Флагманы
+    (re.compile(r"\bs23\s*ultra\b", re.I), "Samsung S23 Ultra", 1300, 2200),
+    (re.compile(r"\bs23\b", re.I), "Samsung S23", 900, 1500),
+    (re.compile(r"\bs22\s*ultra\b", re.I), "Samsung S22 Ultra", 900, 1600),
+    (re.compile(r"\bs22\b", re.I), "Samsung S22", 650, 1100),
+    (re.compile(r"\bs21\s*ultra\b", re.I), "Samsung S21 Ultra", 650, 1100),
+    (re.compile(r"\bs21\b", re.I), "Samsung S21", 450, 800),
+]
+
+# Жесткие стоп-слова (мусор, аксессуары и заблокированные кирпичи)
+STOP_WORDS: List[str] = [
+    "чехол", "чехлы", "бампер", "стекло", "пленка", "гидрогель",
+    "коробка от", "пустая коробка", "запчасти", "на запчасти", "донор",
+    "icloud", "айклауд", "заблокирован", "байпас", "bypass", "парол",
+    "r-sim", "rsim", "рсим", "демо", "demo", "не включается"
 ]
 
 seen_ad_ids: Set[str] = set()
@@ -59,16 +99,43 @@ def get_request_headers() -> Dict[str, str]:
     }
 
 
-def passes_filters(item: dict) -> bool:
+def analyze_phone_deal(item: dict) -> Optional[dict]:
     subject = str(item.get("subject", "")).lower()
+    body = str(item.get("body", "")).lower()
+    full_text = f"{subject} {body}"
 
-    # Фильтруем ТОЛЬКО по заголовку
-    for stop_word in TITLE_EXCLUDE_KEYWORDS:
-        if stop_word in subject:
-            logger.info(f"[FILTER] Пропущен лот '{subject}' (стоп-слово: '{stop_word}')")
-            return False
+    # 1. Проверяем стоп-слова (если это чехол или заблокированный кирпич — отбой)
+    for word in STOP_WORDS:
+        if word in full_text:
+            return None
 
-    return True
+    # 2. Получаем цену в BYN
+    raw_price = item.get("price_byn", "0")
+    if not str(raw_price).isdigit():
+        return None
+    price_byn = int(raw_price) / 100.0
+
+    # 3. Сверяем с матрицей цен выкупа
+    for pattern, model_name, max_price, market_price in PRICE_MATRIX:
+        if pattern.search(subject):
+            # Нашли модель в названии! Проверяем, действительно ли цена «сладкая»
+            if price_byn <= max_price and price_byn >= 70:
+                profit = market_price - price_byn
+                discount_pct = int(((market_price - price_byn) / market_price) * 100)
+                return {
+                    "model": model_name,
+                    "price_byn": price_byn,
+                    "market_price": market_price,
+                    "profit": profit,
+                    "discount_pct": discount_pct,
+                }
+            else:
+                logger.info(
+                    f"[SKIP] {model_name} за {price_byn:.0f} BYN (дороже порога выкупа {max_price:.0f} BYN)"
+                )
+                return None
+
+    return None
 
 
 async def fetch_kufar_ads(session: aiohttp.ClientSession) -> List[dict]:
@@ -79,38 +146,20 @@ async def fetch_kufar_ads(session: aiohttp.ClientSession) -> List[dict]:
             headers=get_request_headers(),
             timeout=aiohttp.ClientTimeout(total=15),
         ) as response:
-            status = response.status
-            if status != 200:
-                logger.warning(f"[PARSER] Kufar ответил HTTP статусом: {status}")
+            if response.status != 200:
+                logger.warning(f"[API] Статус Kufar: {response.status}")
                 return []
-
             data = await response.json()
-            items = data.get("ads", [])
-            return items
-
-    except asyncio.TimeoutError:
-        logger.error("[PARSER ERROR] Таймаут соединения с Kufar API.")
-        return []
+            return data.get("ads", [])
     except Exception as exc:
-        logger.error(f"[PARSER ERROR] Ошибка при запросе: {exc}")
+        logger.error(f"[API ERROR] Ошибка запроса: {exc}")
         return []
 
 
-async def notify_ad(bot: Bot, item: dict, chat_id: str) -> None:
+async def notify_sweet_deal(bot: Bot, item: dict, deal: dict, chat_id: str) -> None:
     ad_id = str(item.get("ad_id", ""))
     subject = item.get("subject", "Без названия")
     ad_link = item.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
-
-    price_byn = item.get("price_byn", "0")
-    price_usd = item.get("price_usd", "")
-    
-    if str(price_byn).isdigit() and int(price_byn) > 0:
-        price_str = f"<b>{int(price_byn) / 100:.2f} BYN</b>"
-    else:
-        price_str = "Договорная"
-
-    if price_usd and str(price_usd).isdigit():
-        price_str += f" (~${int(price_usd) / 100:.0f})"
 
     parameters = item.get("ad_parameters", [])
     location = "Беларусь"
@@ -119,15 +168,19 @@ async def notify_ad(bot: Bot, item: dict, chat_id: str) -> None:
             location = param.get("vl", location)
 
     message_text = (
-        f"📱 <b>Новый телефон на Kufar!</b>\n\n"
-        f"📌 <b>{subject}</b>\n"
-        f"💰 Цена: {price_str}\n"
-        f"📍 Локация: {location}\n"
+        f"🚨 <b>ЖИРНЫЙ ЛОТ ПОД ВЫКУП!</b> 🚨\n\n"
+        f"📱 <b>Модель:</b> {deal['model']}\n"
+        f"📌 <i>{subject}</i>\n\n"
+        f"🔥 <b>Цена продавца:</b> <code>{deal['price_byn']:.0f} BYN</code>\n"
+        f"📊 <b>Рыночная цена:</b> ~{deal['market_price']:.0f} BYN\n"
+        f"💸 <b>Потенциальный профит:</b> +{deal['profit']:.0f} BYN (-{deal['discount_pct']}%)\n"
+        f"📍 <b>Локация:</b> {location}\n\n"
+        f"⚠️ <i>Проверьте телефон на оригинальность и iCloud перед покупкой!</i>"
     )
 
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔗 Открыть объявление", url=ad_link)]
+            [InlineKeyboardButton(text="⚡️ СРОЧНО ОТКРЫТЬ НА KUFAR", url=ad_link)]
         ]
     )
 
@@ -138,20 +191,20 @@ async def notify_ad(bot: Bot, item: dict, chat_id: str) -> None:
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
         )
-        logger.info(f"[TELEGRAM] >>> УСПЕШНО ОТПРАВЛЕН ЛОТ: {subject} ({price_str})")
+        logger.info(f"[ALERT SENT] Отправлен жирный лот: {deal['model']} за {deal['price_byn']} BYN!")
     except Exception as exc:
-        logger.error(f"[TELEGRAM ERROR] Не удалось отправить сообщение: {exc}")
+        logger.error(f"[TELEGRAM ERROR] Не удалось отправить: {exc}")
 
 
 async def monitoring_worker(bot: Bot) -> None:
     global is_first_run
-    logger.info("[WORKER] Воркер мониторинга Kufar запущен.")
+    logger.info("[WORKER] Охотник за низом рынка запущен.")
 
     async with aiohttp.ClientSession() as session:
         while True:
             try:
                 ads = await fetch_kufar_ads(session)
-                new_count = 0
+                sweet_deals_found = 0
 
                 for item in reversed(ads):
                     ad_id = str(item.get("ad_id", ""))
@@ -162,25 +215,26 @@ async def monitoring_worker(bot: Bot) -> None:
                         seen_ad_ids.add(ad_id)
 
                         if not is_first_run:
-                            if passes_filters(item):
-                                await notify_ad(bot, item, TARGET_CHAT_ID)
-                                new_count += 1
-                                await asyncio.sleep(1.2)
+                            deal = analyze_phone_deal(item)
+                            if deal:
+                                await notify_sweet_deal(bot, item, deal, TARGET_CHAT_ID)
+                                sweet_deals_found += 1
+                                await asyncio.sleep(1.0)
 
                 if is_first_run:
-                    logger.info(f"[WORKER] Инициализация: кэшировано {len(seen_ad_ids)} текущих лотов.")
+                    logger.info(f"[WORKER] Инициализация. В памяти сохранено {len(seen_ad_ids)} текущих объявлений.")
                     is_first_run = False
                 else:
-                    logger.info(f"[WORKER] Проверка завершена. Получено лотов из API: {len(ads)}, отправлено в TG: {new_count}")
+                    logger.info(f"[WORKER] Проверено лотов: {len(ads)}. Жирных находок: {sweet_deals_found}")
 
             except Exception as e:
-                logger.error(f"[WORKER ERROR] Сбой в цикле мониторинга: {e}", exc_info=True)
+                logger.error(f"[WORKER CRITICAL ERROR] Ошибка цикла: {e}", exc_info=True)
 
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
 
 async def health_check_handler(request: web.Request) -> web.Response:
-    return web.Response(text="OK - Kufar Bot Alive", content_type="text/plain")
+    return web.Response(text="OK - Kufar Hunter Alive", content_type="text/plain")
 
 
 def create_web_application() -> web.Application:
@@ -196,19 +250,17 @@ dp = Dispatcher()
 @dp.message(CommandStart())
 async def handle_start(message: types.Message) -> None:
     await message.answer(
-        f"👋 <b>Kufar Monitor активен!</b>\n\n"
-        f"Ваш Chat ID: <code>{message.chat.id}</code>\n"
-        f"Фильтры:\n"
-        f"• Категория: Мобильные телефоны\n"
-        f"• Цена: от 80 до 5000 BYN\n"
-        f"• Проверка каждые 30 секунд.",
+        f"🎯 <b>Бот-охотник за низом рынка активен!</b>\n\n"
+        f"Я отслеживаю iPhone (от 11 до 15 Pro Max) и флагманы Samsung.\n"
+        f"Если появится лот с огромным дисконтом к рынку — я сразу пришлю алерт с расчетом профита!\n\n"
+        f"Ваш Chat ID: <code>{message.chat.id}</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
-        logger.error("ОШИБКА: TELEGRAM_BOT_TOKEN не задан!")
+        logger.error("TELEGRAM_BOT_TOKEN не указан!")
         return
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -218,7 +270,7 @@ async def main() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
     await site.start()
-    logger.info(f"[WEB] Веб-сервер слушает порт {WEB_PORT}")
+    logger.info(f"[WEB] Keep-alive сервер слушает порт {WEB_PORT}")
 
     monitoring_task = asyncio.create_task(monitoring_worker(bot))
 
