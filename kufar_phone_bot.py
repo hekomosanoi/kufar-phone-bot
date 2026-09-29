@@ -1,287 +1,270 @@
 import asyncio
 import logging
-import sqlite3
-import re
-import json
 import os
+import sys
+from typing import Dict, List, Optional, Set
+
 import aiohttp
 from aiohttp import web
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-
-# =====================================================================
-# НАСТРОЙКИ И ТОКЕНЫ
-# =====================================================================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-PORT = int(os.getenv("PORT", 8080))
-CHECK_INTERVAL_SECONDS = 75
-DB_PATH = "kufar_phones.db"
+from aiogram.filters import CommandStart
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("KufarPhoneBot")
+logger = logging.getLogger("kufar_monitor")
 
-class Database:
-    """Модуль работы с локальной базой данных SQLite"""
-    def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
-        self.init_db()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "YOUR_TELEGRAM_CHAT_ID")
+WEB_PORT = int(os.getenv("PORT", 10000))
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 45))
 
-    def get_connection(self):
-        return sqlite3.connect(self.db_path)
+# Target query parameters for Kufar search API
+# You can customize category, price range, or keywords
+KUFAR_SEARCH_API_URL = "https://api.kufar.by/search-api/v1/search/rendered-paginated"
 
-    def init_db(self):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    min_budget INTEGER DEFAULT 100,
-                    max_budget INTEGER DEFAULT 800,
-                    min_discount_percent INTEGER DEFAULT 20,
-                    allow_minor_defects INTEGER DEFAULT 1,
-                    brands TEXT DEFAULT 'Все',
-                    is_active INTEGER DEFAULT 1
+DEFAULT_PARAMS: Dict[str, str] = {
+    "cat": "17010",          # Electronics / Phones category (example)
+    "prc": "r:100,800",      # Price range in BYN (min:max), comment or adjust as needed
+    "sort": "lst.d",         # Sort by newest first (strictly descending)
+    "size": "20",            # Check latest 20 items per cycle
+}
+
+# Optional keywords filtering (case-insensitive)
+# Leave empty [] to track all listings in the category
+INCLUDE_KEYWORDS: List[str] = []
+# Stop-words to filter out spam or undesired ads
+EXCLUDE_KEYWORDS: List[str] = ["чехол", "стекло", "аксессуар", "запчасти", "коробка"]
+
+# In-memory deduplication set to prevent duplicate Telegram alerts
+seen_ad_ids: Set[str] = set()
+is_first_run: bool = True
+
+
+def get_request_headers() -> Dict[str, str]:
+    """Provides standard browser-like headers to avoid generic API blocks."""
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.kufar.by/",
+        "Origin": "https://www.kufar.by",
+    }
+
+
+def passes_filters(item: dict) -> bool:
+    """Evaluates whether an ad passes keyword and parameter constraints."""
+    subject = str(item.get("subject", "")).lower()
+    body = str(item.get("body", "")).lower()
+    full_text = f"{subject} {body}"
+
+    # Check for excluded keywords
+    for stop_word in EXCLUDE_KEYWORDS:
+        if stop_word.lower() in full_text:
+            return False
+
+    # Check for included keywords if specified
+    if INCLUDE_KEYWORDS:
+        matched = any(kw.lower() in full_text for kw in INCLUDE_KEYWORDS)
+        if not matched:
+            return False
+
+    return True
+
+
+async def fetch_kufar_ads(session: aiohttp.ClientSession) -> List[dict]:
+    """Sends asynchronous request to Kufar search API with error diagnostics."""
+    try:
+        async with session.get(
+            KUFAR_SEARCH_API_URL,
+            params=DEFAULT_PARAMS,
+            headers=get_request_headers(),
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            status = response.status
+            if status != 200:
+                logger.warning(
+                    f"[PARSER ERROR] Kufar returned non-200 HTTP code: {status}"
                 )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS seen_ads (
-                    ad_id TEXT PRIMARY KEY,
-                    price_byn REAL,
-                    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.commit()
+                return []
 
-    def get_or_create_user(self, user_id: int) -> dict:
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-            row = cursor.fetchone()
-            if not row:
-                cursor.execute("""
-                    INSERT INTO users (user_id, min_budget, max_budget, min_discount_percent, allow_minor_defects, brands, is_active)
-                    VALUES (?, 100, 800, 20, 1, 'Все', 1)
-                """, (user_id,))
-                conn.commit()
-                return {
-                    "user_id": user_id, "min_budget": 100, "max_budget": 800,
-                    "min_discount_percent": 20, "allow_minor_defects": 1,
-                    "brands": "Все", "is_active": 1
-                }
-            return {
-                "user_id": row[0], "min_budget": row[1], "max_budget": row[2],
-                "min_discount_percent": row[3], "allow_minor_defects": row[4],
-                "brands": row[5], "is_active": row[6]
-            }
+            data = await response.json()
+            items = data.get("ads", [])
+            logger.info(f"[PARSER] Successfully fetched {len(items)} ads from Kufar API.")
+            return items
 
-    def update_user_budget(self, user_id: int, min_b: int, max_b: int):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE users SET min_budget = ?, max_budget = ? WHERE user_id = ?", (min_b, max_b, user_id))
-            conn.commit()
+    except asyncio.TimeoutError:
+        logger.error("[PARSER ERROR] Network timeout while requesting Kufar API.")
+        return []
+    except Exception as exc:
+        logger.error(f"[PARSER ERROR] Unexpected exception during fetch: {exc}", exc_info=True)
+        return []
 
-    def update_user_defects(self, user_id: int, allow: int):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE users SET allow_minor_defects = ? WHERE user_id = ?", (allow, user_id))
-            conn.commit()
 
-    def update_user_brands(self, user_id: int, brands: str):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE users SET brands = ? WHERE user_id = ?", (brands, user_id))
-            conn.commit()
+async def notify_ad(bot: Bot, item: dict, chat_id: str) -> None:
+    """Formats and transmits the listing alert with direct link and price info."""
+    ad_id = str(item.get("ad_id", ""))
+    subject = item.get("subject", "Без названия")
+    ad_link = item.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
 
-    def get_active_users(self) -> List[dict]:
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, min_budget, max_budget, min_discount_percent, allow_minor_defects, brands, is_active FROM users WHERE is_active = 1")
-            rows = cursor.fetchall()
-            return [
-                {
-                    "user_id": r[0], "min_budget": r[1], "max_budget": r[2],
-                    "min_discount_percent": r[3], "allow_minor_defects": r[4],
-                    "brands": r[5], "is_active": r[6]
-                }
-                for r in rows
-            ]
+    # Parse pricing details
+    price_byn = item.get("price_byn", "Договорная")
+    price_usd = item.get("price_usd", "")
+    price_str = f"<b>{int(price_byn) / 100:.2f} BYN</b>" if str(price_byn).isdigit() else str(price_byn)
+    if price_usd and str(price_usd).isdigit():
+        price_str += f" (~${int(price_usd) / 100:.0f})"
 
-    def is_ad_seen(self, ad_id: str) -> bool:
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM seen_ads WHERE ad_id = ?", (ad_id,))
-            return cursor.fetchone() is not None
+    # Extract location parameters if present
+    parameters = item.get("ad_parameters", [])
+    location = "Беларусь"
+    for param in parameters:
+        if param.get("p") == "area":
+            location = param.get("vl", location)
 
-    def mark_ad_seen(self, ad_id: str, price_byn: float):
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT OR IGNORE INTO seen_ads (ad_id, price_byn) VALUES (?, ?)", (ad_id, price_byn))
-            conn.commit()
+    message_text = (
+        f"🔥 <b>Новое объявление на Kufar!</b>\n\n"
+        f"📌 <b>{subject}</b>\n"
+        f"💰 Цена: {price_str}\n"
+        f"📍 Локация: {location}\n"
+    )
 
-db = Database()
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Открыть на Kufar", url=ad_link)]
+        ]
+    )
 
-# Базовые ориентиры цен рынка (BYN)
-BENCHMARK_PRICES = {
-    "iphone 11 64": 650,
-    "iphone 11 128": 750,
-    "iphone 12 mini": 800,
-    "iphone 12 64": 950,
-    "iphone 12 128": 1100,
-    "iphone 12 pro 128": 1350,
-    "iphone 13 mini": 1250,
-    "iphone 13 128": 1500,
-    "iphone 13 pro 128": 1850,
-    "iphone 13 pro max 128": 2100,
-    "iphone 14 128": 1850,
-    "iphone 14 pro 128": 2350,
-    "iphone 15 128": 2250,
-    "iphone 15 pro 128": 2900,
-    "iphone xr 64": 450,
-    "iphone xr 128": 520,
-    "iphone xs 64": 380,
-    "iphone se 2020": 400,
-    "iphone se 2022": 600,
-    "s20 fe": 550,
-    "s21 fe": 750,
-    "s21 ultra": 1100,
-    "s21": 850,
-    "s22": 1100,
-    "s22 ultra": 1600,
-    "s23": 1550,
-    "s23 ultra": 2200,
-    "s24": 2100,
-    "s24 ultra": 3100,
-    "a52": 420,
-    "a53": 520,
-    "a54": 680,
-    "a55": 850,
-    "a34": 520,
-    "a35": 650,
-    "a24": 420,
-    "a25": 550,
-    "redmi note 10 pro": 350,
-    "redmi note 11 pro": 450,
-    "redmi note 12 pro": 580,
-    "redmi note 13 pro": 750,
-    "redmi 12": 320,
-    "redmi 13c": 300,
-    "poco x3 pro": 320,
-    "poco x4 pro": 460,
-    "poco x5 pro": 620,
-    "poco x6 pro": 850,
-    "poco f3": 480,
-    "poco f4": 650,
-    "poco f5": 900,
-    "poco f6": 1200,
-    "xiaomi 12": 850,
-    "xiaomi 13": 1400,
-    "xiaomi 13t": 1150,
-    "xiaomi 14": 1900,
-    "pixel 6a": 620,
-    "pixel 6": 720,
-    "pixel 6 pro": 900,
-    "pixel 7a": 850,
-    "pixel 7": 1050,
-    "pixel 7 pro": 1350,
-    "pixel 8a": 1250,
-    "pixel 8": 1600,
-    "pixel 8 pro": 2100,
-    "realme gt neo": 600,
-    "realme 10": 420,
-    "realme 11 pro": 650,
-    "realme 12 pro": 850,
-    "honor 50": 450,
-    "honor 70": 650,
-    "honor 90": 850,
-    "honor 200": 1100,
-    "honor x9b": 600,
-    "huawei pura 70": 1600,
-    "huawei nova 11": 650,
-    "infinix note 30": 400,
-    "infinix note 40": 550,
-    "infinix zero 30": 650,
-    "tecno camon 20": 420,
-    "tecno camon 30": 600,
-    "tecno pova 5": 380,
-    "tecno pova 6": 550,
-    "oneplus 9": 700,
-    "oneplus 10 pro": 1050,
-    "oneplus 11": 1500,
-    "oneplus 12": 2200,
-    "oneplus nord ce": 500,
-    "nothing phone 1": 850,
-    "nothing phone 2": 1400,
-    "nothing phone 2a": 950
-}
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=message_text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=markup,
+            disable_web_page_preview=False,
+        )
+        logger.info(f"[TELEGRAM] Sent alert for ad ID: {ad_id}")
+    except Exception as exc:
+        logger.error(f"[TELEGRAM ERROR] Failed to send message for ad {ad_id}: {exc}")
 
-# Строгие стоп-слова
-STRICT_STOP_WORDS = [
-    "icloud", "айклауд", "байпас", "bypass", "копия", "реплика", "фейк",
-    "frp", "google lock", "гугл аккаунт", "аккаунт гугл", "ми аккаунт", "mi account", 
-    "mi cloud", "ми клауд", "huawei id", "хуавей ид", "samsung account", "knox guard", 
-    "knox", "лизинг", "яндекс плюс", "сплит", "подписк", "заблокирован оператором", "sim lock",
-    "ldu", "live demo", "демо образец",
-    "на запчасти", "под восстановление", "не включается", "залит", "утопленник", 
-    "mdm", "демо", "demo", "не видит сеть", "без сети", "не звонит", "кирпич",
-    "отвал", "реболл", "bootloop", "бутлуп", "вечный ребут", "перезагружается сам", 
-    "зеленая полоса", "зеленые полосы", "полоса на экране", "черное пятно"
-]
 
-KIT_NUANCES = {
-    "без коробк": "Без коробки",
-    "нет коробк": "Без коробки",
-    "без комплект": "Только телефон (без комплекта)",
-    "нет комплект": "Без комплекта",
-    "без зарядк": "Без зарядного устройства / блока",
-    "нет зарядк": "Без зарядного блока",
-    "без блок": "Без блока питания",
-    "без шнур": "Без кабеля",
-    "без провод": "Без кабеля",
-    "без чек": "Без чека/документов",
-    "нет чек": "Без чека",
-    "только телефон": "Только сам телефон (без аксессуаров)"
-}
+async def monitoring_worker(bot: Bot) -> None:
+    """Continuous background loop for scanning and dispatching new listings."""
+    global is_first_run
+    logger.info("[WORKER] Monitoring background worker initialized and running.")
 
-MINOR_DEFECTS = {
-    "акб": "Слабый АКБ / требует замены (расход ~45-75 BYN)",
-    "батаре": "Износ аккумулятора",
-    "трещина сзади": "Треснула задняя крышка (чехол решает, ремонт ~35-50 BYN)",
-    "задней крышк": "Царапины/трещина крышки",
-    "царапин": "Следы эксплуатации / царапины",
-    "потертост": "Потертости корпуса",
-    "потёртост": "Потертости корпуса",
-    "скол": "Мелкие сколы по корпусу / рамке",
-    "не работает truetone": "Нет TrueTone (менялся дисплей, но рабочий)",
-    "не работает трутон": "Нет TrueTone (менялся дисплей)",
-    "выгоран": "Выгорание AMOLED экрана / остаточные значки (отличный повод для торга!)",
-    "остаточное изображени": "Остаточное изображение на дисплее",
-    "китайск": "Китайская версия (CN / перешит)"
-}
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                logger.info("[WORKER] Starting regular ad polling cycle...")
+                ads = await fetch_kufar_ads(session)
 
-def detect_brand(title: str, body: str) -> Tuple[str, bool]:
-    text = f"{title} {body}".lower()
-    if any(k in text for k in ["iphone", "айфон", "apple", "ios"]):
-        return "Apple (iOS)", False
+                new_items_found = 0
+                for item in reversed(ads):  # Process oldest to newest
+                    ad_id = str(item.get("ad_id", ""))
+                    if not ad_id:
+                        continue
 
-    android_brands = [
-        ("Samsung", ["samsung", "самсунг", "galaxy", "галакси"]),
-        ("Xiaomi / POCO", ["xiaomi", "сяоми", "redmi", "редми", "poco", "поко"]),
-        ("Google Pixel", ["pixel", "пиксель", "google"]),
-        ("Honor", ["honor", "хонор"]),
-        ("Huawei", ["huawei", "хуавей"]),
-        ("Realme", ["realme", "реалми"]),
-        ("Tecno", ["tecno", "текно"]),
-        ("Infinix", ["infinix", "инфиникс"]),
-        ("OnePlus", ["oneplus", "ванплас", "1+"]),
+                    if ad_id not in seen_ad_ids:
+                        seen_ad_ids.add(ad_id)
+
+                        # Prevent flooding all existing ads on initial startup
+                        if not is_first_run:
+                            if passes_filters(item):
+                                await notify_ad(bot, item, TARGET_CHAT_ID)
+                                new_items_found += 1
+                                await asyncio.sleep(1.0)  # Gentle spacing between sends
+
+                if is_first_run:
+                    logger.info(
+                        f"[WORKER] Initial scan complete. Cached {len(seen_ad_ids)} existing ads without spamming."
+                    )
+                    is_first_run = False
+                else:
+                    logger.info(f"[WORKER] Polling cycle finished. Fresh matches sent: {new_items_found}")
+
+            except Exception as e:
+                logger.error(f"[WORKER CRITICAL ERROR] Unhandled loop failure: {e}", exc_info=True)
+
+            logger.info(f"[WORKER] Sleeping for {CHECK_INTERVAL_SECONDS} seconds before next run.")
+            await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+async def health_check_handler(request: web.Request) -> web.Response:
+    """Responds with HTTP 200 to keep the free Render container awake."""
+    return web.Response(
+        text=f"OK. Kufar Monitor is alive. Cached items: {len(seen_ad_ids)}",
+        content_type="text/plain",
+    )
+
+
+def create_web_application() -> web.Application:
+    """Configures the internal HTTP web application."""
+    app = web.Application()
+    app.router.add_get("/", health_check_handler)
+    app.router.add_get("/healthz", health_check_handler)
+    return app
+
+
+dp = Dispatcher()
+
+
+@dp.message(CommandStart())
+async def handle_start(message: types.Message) -> None:
+    """Informs the user about the bot status and reveals user/chat ID."""
+    await message.answer(
+        f"👋 <b>Kufar Monitor активен!</b>\n\n"
+        f"Ваш Chat ID: <code>{message.chat.id}</code>\n"
+        f"В базе отслежено объявлений: {len(seen_ad_ids)}\n"
+        f"Используйте этот Chat ID в переменной окружения <code>TARGET_CHAT_ID</code>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def main() -> None:
+    """Coordinates the simultaneous execution of web server, bot polling, and parser worker."""
+    if TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN is not configured! Exiting.")
+        return
+
+    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+
+    # 1. Start aiohttp HTTP web server for Render keep-alive
+    app = create_web_application()
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", WEB_PORT)
+    await site.start()
+    logger.info(f"[WEB] Keep-alive server running on port {WEB_PORT}")
+
+    # 2. Launch parser monitoring task in background
+    monitoring_task = asyncio.create_task(monitoring_worker(bot))
+
+    # 3. Start aiogram bot dispatcher polling
+    try:
+        logger.info("[BOT] Starting Telegram bot polling...")
+        # Drop previous pending updates to prevent startup burst
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot)
+    finally:
+        monitoring_task.cancel()
+        await runner.cleanup()
+        await bot.session.close()
+        logger.info("[SHUTDOWN] Services successfully terminated.")
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot application interrupted manually.")"OnePlus", ["oneplus", "ванплас", "1+"]),
         ("Nothing", ["nothing phone", "насинг"]),
         ("Motorola", ["motorola", "моторола", "moto"]),
         ("Vivo / iQOO", ["vivo", "виво", "iqoo"]),
