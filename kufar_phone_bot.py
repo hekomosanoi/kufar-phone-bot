@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -9,7 +10,8 @@ import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logging.basicConfig(
@@ -20,22 +22,52 @@ logging.basicConfig(
 logger = logging.getLogger("kufar_hunter")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TARGET_CHAT_ID = os.getenv("TARGET_CHAT_ID", "7805601948")
+DEFAULT_ADMIN_CHAT_ID = os.getenv("TARGET_CHAT_ID", "7805601948")
 WEB_PORT = int(os.getenv("PORT", 10000))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", 25))
+SUBSCRIBERS_FILE = "subscribers.json"
 
 KUFAR_SEARCH_API_URL = "https://api.kufar.by/search-api/v1/search/rendered-paginated"
 
 DEFAULT_PARAMS: Dict[str, str] = {
-    "cat": "17010",          # Телефоны
-    "sort": "lst.d",         # Новые первыми
+    "cat": "17010",          # Раздел: Телефоны
+    "sort": "lst.d",         # Сортировка: Свежие первыми
     "size": "30",            # 30 последних объявлений
 }
 
-# ---------------------------------------------------------------------------
-# МАТРИЦА ОХОТЫ ЗА СЛАДКИМИ ЦЕНАМИ (в рублях BYN)
-# Формат: регулярка для поиска модели -> (Макс. цена входа, Примерный рынок)
-# ---------------------------------------------------------------------------
+subscribers: Set[str] = set()
+
+
+def load_subscribers() -> Set[str]:
+    """Загружает список chat_id подписчиков из файла."""
+    loaded = set()
+    if os.path.exists(SUBSCRIBERS_FILE):
+        try:
+            with open(SUBSCRIBERS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    loaded = set(str(uid) for uid in data)
+        except Exception as err:
+            logger.error(f"[STORAGE] Ошибка чтения {SUBSCRIBERS_FILE}: {err}")
+
+    # Гарантируем, что ваш аккаунт всегда подписан по умолчанию
+    if DEFAULT_ADMIN_CHAT_ID:
+        loaded.add(str(DEFAULT_ADMIN_CHAT_ID))
+    return loaded
+
+
+def save_subscribers(subs: Set[str]) -> None:
+    """Сохраняет текущий список подписчиков на диск."""
+    try:
+        with open(SUBSCRIBERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(subs), f, ensure_ascii=False, indent=2)
+    except Exception as err:
+        logger.error(f"[STORAGE] Ошибка сохранения {SUBSCRIBERS_FILE}: {err}")
+
+
+subscribers = load_subscribers()
+logger.info(f"[STORAGE] Активных подписчиков при старте: {len(subscribers)} ({subscribers})")
+
 PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
     # iPhone
     (re.compile(r"\b15\s*pro\s*max\b", re.I), "iPhone 15 Pro Max", 1900, 3100),
@@ -73,7 +105,6 @@ PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
     (re.compile(r"\bs21\b", re.I), "Samsung S21", 450, 800),
 ]
 
-# Жесткие стоп-слова (мусор, аксессуары и заблокированные кирпичи)
 STOP_WORDS: List[str] = [
     "чехол", "чехлы", "бампер", "стекло", "пленка", "гидрогель",
     "коробка от", "пустая коробка", "запчасти", "на запчасти", "донор",
@@ -83,7 +114,6 @@ STOP_WORDS: List[str] = [
 
 seen_ad_ids: Set[str] = set()
 is_first_run: bool = True
-
 
 def get_request_headers() -> Dict[str, str]:
     return {
@@ -104,7 +134,7 @@ def analyze_phone_deal(item: dict) -> Optional[dict]:
     body = str(item.get("body", "")).lower()
     full_text = f"{subject} {body}"
 
-    # 1. Проверяем стоп-слова (если это чехол или заблокированный кирпич — отбой)
+    # 1. Проверяем стоп-слова
     for word in STOP_WORDS:
         if word in full_text:
             return None
@@ -118,7 +148,6 @@ def analyze_phone_deal(item: dict) -> Optional[dict]:
     # 3. Сверяем с матрицей цен выкупа
     for pattern, model_name, max_price, market_price in PRICE_MATRIX:
         if pattern.search(subject):
-            # Нашли модель в названии! Проверяем, действительно ли цена «сладкая»
             if price_byn <= max_price and price_byn >= 70:
                 profit = market_price - price_byn
                 discount_pct = int(((market_price - price_byn) / market_price) * 100)
@@ -130,13 +159,9 @@ def analyze_phone_deal(item: dict) -> Optional[dict]:
                     "discount_pct": discount_pct,
                 }
             else:
-                logger.info(
-                    f"[SKIP] {model_name} за {price_byn:.0f} BYN (дороже порога выкупа {max_price:.0f} BYN)"
-                )
                 return None
 
     return None
-
 
 async def fetch_kufar_ads(session: aiohttp.ClientSession) -> List[dict]:
     try:
@@ -156,7 +181,13 @@ async def fetch_kufar_ads(session: aiohttp.ClientSession) -> List[dict]:
         return []
 
 
-async def notify_sweet_deal(bot: Bot, item: dict, deal: dict, chat_id: str) -> None:
+async def broadcast_sweet_deal(bot: Bot, item: dict, deal: dict) -> None:
+    """Рассылает найденный лот всем активным подписчикам."""
+    global subscribers
+    if not subscribers:
+        logger.warning("[BROADCAST] Нет подписчиков для отправки.")
+        return
+
     ad_id = str(item.get("ad_id", ""))
     subject = item.get("subject", "Без названия")
     ad_link = item.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
@@ -184,17 +215,29 @@ async def notify_sweet_deal(bot: Bot, item: dict, deal: dict, chat_id: str) -> N
         ]
     )
 
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=message_text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=markup,
-        )
-        logger.info(f"[ALERT SENT] Отправлен жирный лот: {deal['model']} за {deal['price_byn']} BYN!")
-    except Exception as exc:
-        logger.error(f"[TELEGRAM ERROR] Не удалось отправить: {exc}")
+    unreachable_users: Set[str] = set()
 
+    for chat_id in list(subscribers):
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=message_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+            await asyncio.sleep(0.05)  # Небольшая пауза между пользователями
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота
+            unreachable_users.add(chat_id)
+            logger.info(f"[BROADCAST] Пользователь {chat_id} заблокировал бота, удаляем из рассылки.")
+        except Exception as exc:
+            logger.error(f"[BROADCAST ERROR] Не удалось отправить {chat_id}: {exc}")
+
+    if unreachable_users:
+        subscribers -= unreachable_users
+        save_subscribers(subscribers)
+
+    logger.info(f"[BROADCAST SENT] Лот {deal['model']} ({deal['price_byn']} BYN) разослан {len(subscribers)} подписчикам!")
 
 async def monitoring_worker(bot: Bot) -> None:
     global is_first_run
@@ -217,7 +260,7 @@ async def monitoring_worker(bot: Bot) -> None:
                         if not is_first_run:
                             deal = analyze_phone_deal(item)
                             if deal:
-                                await notify_sweet_deal(bot, item, deal, TARGET_CHAT_ID)
+                                await broadcast_sweet_deal(bot, item, deal)
                                 sweet_deals_found += 1
                                 await asyncio.sleep(1.0)
 
@@ -232,9 +275,11 @@ async def monitoring_worker(bot: Bot) -> None:
 
             await asyncio.sleep(CHECK_INTERVAL_SECONDS)
 
-
 async def health_check_handler(request: web.Request) -> web.Response:
-    return web.Response(text="OK - Kufar Hunter Alive", content_type="text/plain")
+    return web.Response(
+        text=f"OK - Kufar Hunter Alive. Subscribers: {len(subscribers)}",
+        content_type="text/plain",
+    )
 
 
 def create_web_application() -> web.Application:
@@ -243,20 +288,37 @@ def create_web_application() -> web.Application:
     app.router.add_get("/healthz", health_check_handler)
     return app
 
-
 dp = Dispatcher()
 
 
 @dp.message(CommandStart())
 async def handle_start(message: types.Message) -> None:
+    user_id = str(message.chat.id)
+    if user_id not in subscribers:
+        subscribers.add(user_id)
+        save_subscribers(subscribers)
+        logger.info(f"[NEW SUBSCRIBER] Добавлен пользователь: {user_id}. Всего: {len(subscribers)}")
+
     await message.answer(
-        f"🎯 <b>Бот-охотник за низом рынка активен!</b>\n\n"
-        f"Я отслеживаю iPhone (от 11 до 15 Pro Max) и флагманы Samsung.\n"
-        f"Если появится лот с огромным дисконтом к рынку — я сразу пришлю алерт с расчетом профита!\n\n"
-        f"Ваш Chat ID: <code>{message.chat.id}</code>",
+        f"🎯 <b>Вы успешно подписаны на уведомления!</b>\n\n"
+        f"Я отслеживаю iPhone (от 11 до 15 Pro Max) и флагманы Samsung по низу рынка.\n"
+        f"Как только появится жирный лот с дисконтом — вам сразу придет оповещение.\n\n"
+        f"👥 Всего подписчиков в системе: <b>{len(subscribers)}</b>\n"
+        f"🔕 Если захотите отписаться: /stop",
         parse_mode=ParseMode.HTML,
     )
 
+
+@dp.message(Command("stop"))
+async def handle_stop(message: types.Message) -> None:
+    user_id = str(message.chat.id)
+    if user_id in subscribers:
+        subscribers.remove(user_id)
+        save_subscribers(subscribers)
+        logger.info(f"[UNSUBSCRIBE] Пользователь отписался: {user_id}")
+        await message.answer("🔕 <b>Вы отписались от уведомлений.</b> Чтобы возобновить, нажмите /start", parse_mode=ParseMode.HTML)
+    else:
+        await message.answer("Вы и так не были подписаны. Чтобы включить рассылку, нажмите /start")
 
 async def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
