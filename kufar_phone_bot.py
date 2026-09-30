@@ -30,12 +30,11 @@ SUBSCRIBERS_FILE = "subscribers.json"
 KUFAR_SEARCH_API_URL = "https://api.kufar.by/search-api/v1/search/rendered-paginated"
 
 DEFAULT_PARAMS: Dict[str, str] = {
-    "cat": "17010",          # Мобильные телефоны
-    "sort": "lst.d",         # Свежие объявления первыми
+    "cat": "17010",          # Категория «Мобильные телефоны»
+    "sort": "lst.d",         # Новые объявления первыми
     "size": "30",            # Проверять последние 30 объявлений
 }
 
-# (Регулярка названия, Отображаемое имя, Максимальная цена выкупа BYN, Оценка рынка BYN)
 PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
     # ==================== APPLE IPHONE ====================
     (re.compile(r"\b16\s*pro\s*max\b", re.I), "iPhone 16 Pro Max", 2800, 4200),
@@ -124,7 +123,7 @@ PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
     (re.compile(r"\bredmi\s*note\s*8\s*pro\b", re.I), "Redmi Note 8 Pro", 85, 200),
     (re.compile(r"\bredmi\s*note\s*8t?\b", re.I), "Redmi Note 8/8T", 70, 160),
 
-    # ==================== REDMI ЧИСЛОВАЯ СЕРИЯ (БЮДЖЕТНИКИ) ====================
+    # ==================== REDMI ЧИСЛОВАЯ СЕРИЯ ====================
     (re.compile(r"\bredmi\s*13c\b", re.I), "Redmi 13C", 140, 300),
     (re.compile(r"\bredmi\s*12\b", re.I), "Redmi 12", 150, 320),
     (re.compile(r"\bredmi\s*10c\b", re.I), "Redmi 10C", 110, 240),
@@ -184,7 +183,7 @@ PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
     (re.compile(r"\bs10\s*plus\b|\bs10\s*\+\b", re.I), "Samsung S10+", 220, 470),
     (re.compile(r"\bs10e?\b", re.I), "Samsung S10/S10e", 170, 380),
 
-    # ==================== SAMSUNG GALAXY Z (FOLD / FLIP) ====================
+    # ==================== SAMSUNG GALAXY Z ====================
     (re.compile(r"\bz\s*flip\s*5\b", re.I), "Samsung Z Flip 5", 900, 1600),
     (re.compile(r"\bz\s*flip\s*4\b", re.I), "Samsung Z Flip 4", 550, 1050),
     (re.compile(r"\bz\s*flip\s*3\b", re.I), "Samsung Z Flip 3", 380, 700),
@@ -212,7 +211,7 @@ PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
     (re.compile(r"\ba14\b", re.I), "Samsung A14", 150, 320),
     (re.compile(r"\ba13\b|\ba12\b", re.I), "Samsung A12/A13", 110, 240),
 
-    # ==================== INFINIX (НАРОДНЫЙ СПРОС) ====================
+    # ==================== INFINIX ====================
     (re.compile(r"\binfinix\s*gt\s*20\s*pro\b", re.I), "Infinix GT 20 Pro", 450, 850),
     (re.compile(r"\binfinix\s*gt\s*10\s*pro\b", re.I), "Infinix GT 10 Pro", 300, 600),
     (re.compile(r"\binfinix\s*note\s*40\s*pro\b", re.I), "Infinix Note 40 Pro", 360, 700),
@@ -314,9 +313,11 @@ PRICE_MATRIX: List[Tuple[re.Pattern, str, float, float]] = [
     (re.compile(r"\bhuawei\s*nova\s*10\b", re.I), "Huawei Nova 10", 250, 500),
     (re.compile(r"\bhuawei\s*nova\s*9\b", re.I), "Huawei Nova 9", 190, 390),
 
-    # ==================== SONY XPERIA (ФЛАГМАНЫ) ====================
+    # ==================== SONY XPERIA ====================
     (re.compile(r"\bxperia\s*1\s*v\b", re.I), "Sony Xperia 1 V", 1200, 2200),
     (re.compile(r"\bxperia\s*1\s*iv\b", re.I), "Sony Xperia 1 IV", 750, 1400),
     (re.compile(r"\bxperia\s*1\s*iii\b", re.I), "Sony Xperia 1 III", 450, 850),
     (re.compile(r"\bxperia\s*1\s*ii\b", re.I), "Sony Xperia 1 II", 290, 580),
-    (re.compile(r"\bxperia\s*5
+    (re.compile(r"\bxperia\s*5\s*iv\b", re.I), "Sony Xperia 5 IV", 600, 1150),
+    (re.compile(r"\bxperia\s*5\s*iii\b", re.I), "Sony Xperia 5 III", 380, 750),
+    
