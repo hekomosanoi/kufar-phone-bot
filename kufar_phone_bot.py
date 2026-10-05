@@ -5,8 +5,8 @@ import random
 import asyncio
 import logging
 from typing import Dict, Any, List, Optional
-import aiohttp
 from aiohttp import web
+from curl_cffi.requests import AsyncSession
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -102,7 +102,6 @@ def analyze_phone_offer(ad: dict) -> Optional[Dict[str, Any]]:
     if price <= 0:
         return None
 
-    # Отсекаем фатальные поломки и блокировки
     for bad_word in CRITICAL_DEFECT_WORDS:
         if bad_word in full_text:
             return None
@@ -131,7 +130,6 @@ def analyze_phone_offer(ad: dict) -> Optional[Dict[str, Any]]:
         if discount_pct >= 65.0:
             suspiciously_cheap = True
     else:
-        # Для моделей без точного бенчмарка пропускаем в общий поток
         is_profitable = True
 
     return {
@@ -161,39 +159,30 @@ async def fetch_kufar_phones() -> List[dict]:
     }
     
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Origin": "https://www.kufar.by",
         "Referer": "https://www.kufar.by/",
-        "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-site",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache"
     }
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            async with session.get(url, params=params, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    ads = data.get("ads", [])
-                    logger.info(f"[API] Успешный опрос. Получено объявлений: {len(ads)}")
-                    return ads
-                elif resp.status == 403:
-                    logger.warning("[API] Статус Kufar: 403 (Блокировка Cloudflare). Ожидание...")
-                    return []
-                else:
-                    logger.warning(f"[API] Статус Kufar: {resp.status}")
-                    return []
-        except Exception as e:
-            logger.error(f"[API] Ошибка запроса к Kufar: {e}")
-            return []
+    try:
+        # curl_cffi с отпечатком реального браузера chrome120
+        async with AsyncSession(impersonate="chrome120") as session:
+            resp = await session.get(url, params=params, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                ads = data.get("ads", [])
+                logger.info(f"[API] Успешный опрос. Получено объявлений: {len(ads)}")
+                return ads
+            else:
+                logger.warning(f"[API] Статус Kufar: {resp.status_code}")
+                return []
+    except Exception as e:
+        logger.error(f"[API] Ошибка запроса: {e}")
+        return []
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
 dp = Dispatcher()
@@ -224,7 +213,7 @@ async def cmd_check(msg: types.Message):
     if ads:
         await msg.answer(f"✅ Связь с Kufar отличная! Получено свежих объявлений: {len(ads)}")
     else:
-        await msg.answer("⚠️ Kufar вернул пустой список или сработал лимит. Повторите через минуту.")
+        await msg.answer("⚠️ Kufar вернул пустой список или защитный блок. Попробуйте снова через пару минут.")
 
 @dp.callback_query(F.data == "manual_check_btn")
 async def cb_manual_check(callback: types.CallbackQuery):
@@ -233,7 +222,7 @@ async def cb_manual_check(callback: types.CallbackQuery):
     if ads:
         await callback.message.answer(f"✅ Связь работает, получено: {len(ads)} объявлений.")
     else:
-        await callback.message.answer("⚠️ Ответ от Kufar пока пуст (лимит защиты). Попробуйте чуть позже.")
+        await callback.message.answer("⚠️ Kufar пока не вернул данные. Попробуйте чуть позже.")
 
 @dp.callback_query(F.data == "toggle_os")
 async def cb_toggle_os(callback: types.CallbackQuery):
@@ -322,14 +311,14 @@ async def monitor_kufar_loop():
                     try:
                         await bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
                     except Exception as e:
-                        logger.error(f"Ошибка отправки сообщения пользователю {uid}: {e}")
+                        logger.error(f"Ошибка отправки сообщения {uid}: {e}")
 
             if new_found > 0:
                 save_data(db)
         except Exception as e:
             logger.error(f"Ошибка в цикле парсинга: {e}")
 
-        # Безопасный интервал с рандомизацией, чтобы Cloudflare не выдавал 403
+        # Безопасная пауза от 75 до 90 секунд
         await asyncio.sleep(75 + random.randint(5, 15))
 
 async def handle_ping(request):
