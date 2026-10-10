@@ -207,7 +207,7 @@ MINOR_DEFECTS = {
 }
 
 def detect_brand(title: str, body: str) -> Tuple[str, bool]:
-    text = f"{title} {body}".lower()
+    text = f"{title or ''} {body or ''}".lower()
     if any(k in text for k in ["iphone", "айфон", "apple", "ios"]):
         return "Apple (iOS)", False
 
@@ -243,7 +243,7 @@ def extract_memory_info(text: str) -> Optional[str]:
     return None
 
 def analyze_phone_text(title: str, body: str) -> dict:
-    full_text = f"{title} {body}".lower()
+    full_text = f"{title or ''} {body or ''}".lower()
     critical_triggers = [w for w in STRICT_STOP_WORDS if w in full_text]
     
     kit_details = []
@@ -258,7 +258,7 @@ def analyze_phone_text(title: str, body: str) -> dict:
 
     bat_match = re.search(r'(?:акб|батаре[яе]|емкость|ёмкость)\D*?(\d{2,3})\s*%', full_text)
     battery_health = int(bat_match.group(1)) if bat_match else None
-    memory = extract_memory_info(f"{title} {body}")
+    memory = extract_memory_info(f"{title or ''} {body or ''}")
 
     is_dangerous = len(critical_triggers) > 0
     has_minor_defects = len(found_defects) > 0 or (battery_health is not None and battery_health < 80)
@@ -274,7 +274,7 @@ def analyze_phone_text(title: str, body: str) -> dict:
     }
 
 def estimate_market_price(title: str) -> Optional[int]:
-    cleaned = title.lower()
+    cleaned = (title or "").lower()
     for model_key, est_price in BENCHMARK_PRICES.items():
         tokens = model_key.split()
         if all(token in cleaned for token in tokens):
@@ -323,12 +323,12 @@ scraper = KufarScraper()
 
 def evaluate_deal(ad: dict) -> Optional[dict]:
     ad_id = str(ad.get("ad_id", ""))
-    subject = ad.get("subject", "").strip()
-    body = ad.get("body", "").strip()
+    subject = (ad.get("subject") or "").strip()
+    body = (ad.get("body") or "").strip()
     price_byn_raw = ad.get("price_byn", "0")
     
     try:
-        val = float(price_byn_raw)
+        val = float(price_byn_raw or 0)
         price_byn = val / 100.0 if val > 10000 else val
     except (ValueError, TypeError):
         return None
@@ -366,7 +366,7 @@ def evaluate_deal(ad: dict) -> Optional[dict]:
         "analysis": analysis,
         "url": ad_url,
         "is_suspiciously_cheap": is_suspiciously_cheap,
-        "body_preview": (body[:180] + "...") if len(body) > 180 else body
+        "body_preview": (body[:180] + "...") if len(body) > 180 else (body or "Без описания")
     }
 
 # =====================================================================
@@ -644,7 +644,7 @@ async def background_monitoring_loop():
                         continue
                     
                     deal = evaluate_deal(ad)
-                    db.mark_ad_seen(ad_id, float(ad.get("price_byn", 0)) / 100.0)
+                    db.mark_ad_seen(ad_id, float(ad.get("price_byn", 0) or 0) / 100.0)
 
                     if not deal:
                         continue
