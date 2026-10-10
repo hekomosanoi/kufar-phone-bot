@@ -1,345 +1,715 @@
-import os
-import re
-import json
-import random
 import asyncio
 import logging
-from typing import Dict, Any, List, Optional
+import sqlite3
+import re
+import os
+import random
+import aiohttp
 from aiohttp import web
-from curl_cffi.requests import AsyncSession
+from typing import Dict, List, Optional, Tuple
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("kufar_hunter")
+# =====================================================================
+# НАСТРОЙКИ, ТОКЕН И ВАШ ID (ПРИВАТНЫЙ РЕЖИМ)
+# =====================================================================
+# Ваш токен от BotFather
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8680343679:AAH_9hyoIgmP7u3QgYWj1YK1HTQjzb2JKdw").strip()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
+# Ваш персональный Telegram ID (доступ разрешен только вам)
+ALLOWED_USER_ID = 7805601948
 
-PRICE_BENCHMARKS = {
+PORT = int(os.getenv("PORT", 10000))
+CHECK_INTERVAL_SECONDS = 75
+DB_PATH = "kufar_phones.db"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("KufarRadar")
+
+# =====================================================================
+# БАЗА ДАННЫХ (SQLite)
+# =====================================================================
+class Database:
+    def __init__(self, db_path: str = DB_PATH):
+        self.db_path = db_path
+        self.init_db()
+
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
+
+    def init_db(self):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    min_budget INTEGER DEFAULT 100,
+                    max_budget INTEGER DEFAULT 800,
+                    allow_minor_defects INTEGER DEFAULT 1,
+                    brands TEXT DEFAULT 'Все',
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS seen_ads (
+                    ad_id TEXT PRIMARY KEY,
+                    price_byn REAL,
+                    discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+
+    def get_or_create_user(self, user_id: int) -> dict:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, min_budget, max_budget, allow_minor_defects, brands, is_active FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if not row:
+                cursor.execute("""
+                    INSERT INTO users (user_id, min_budget, max_budget, allow_minor_defects, brands, is_active)
+                    VALUES (?, 100, 800, 1, 'Все', 1)
+                """, (user_id,))
+                conn.commit()
+                return {
+                    "user_id": user_id, "min_budget": 100, "max_budget": 800,
+                    "allow_minor_defects": 1, "brands": "Все", "is_active": 1
+                }
+            return {
+                "user_id": row[0], "min_budget": row[1], "max_budget": row[2],
+                "allow_minor_defects": row[3], "brands": row[4], "is_active": row[5]
+            }
+
+    def update_user_budget(self, user_id: int, min_b: int, max_b: int):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET min_budget = ?, max_budget = ? WHERE user_id = ?", (min_b, max_b, user_id))
+            conn.commit()
+
+    def update_user_defects(self, user_id: int, allow: int):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET allow_minor_defects = ? WHERE user_id = ?", (allow, user_id))
+            conn.commit()
+
+    def update_user_brands(self, user_id: int, brands: str):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE users SET brands = ? WHERE user_id = ?", (brands, user_id))
+            conn.commit()
+
+    def get_active_users(self) -> List[dict]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id, min_budget, max_budget, allow_minor_defects, brands, is_active FROM users WHERE is_active = 1")
+            rows = cursor.fetchall()
+            return [
+                {
+                    "user_id": r[0], "min_budget": r[1], "max_budget": r[2],
+                    "allow_minor_defects": r[3], "brands": r[4], "is_active": r[5]
+                }
+                for r in rows
+                if r[0] == ALLOWED_USER_ID  # Строгий фильтр: отправлять только вам
+            ]
+
+    def is_ad_seen(self, ad_id: str) -> bool:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM seen_ads WHERE ad_id = ?", (ad_id,))
+            return cursor.fetchone() is not None
+
+    def mark_ad_seen(self, ad_id: str, price_byn: float):
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT OR IGNORE INTO seen_ads (ad_id, price_byn) VALUES (?, ?)", (ad_id, price_byn))
+            conn.commit()
+
+    def get_total_seen_count(self) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM seen_ads")
+            row = cursor.fetchone()
+            return row[0] if row else 0
+
+db = Database()
+
+# =====================================================================
+# ЦЕНОВЫЕ ОРИЕНТИРЫ РЫНКА (BYN)
+# =====================================================================
+BENCHMARK_PRICES = {
     # Apple
-    "iphone 11": 550, "iphone 11 pro": 750, "iphone 11 pro max": 900,
-    "iphone 12 mini": 680, "iphone 12": 820, "iphone 12 pro": 1150, "iphone 12 pro max": 1350,
-    "iphone 13 mini": 1050, "iphone 13": 1300, "iphone 13 pro": 1650, "iphone 13 pro max": 1850,
-    "iphone 14": 1650, "iphone 14 plus": 1800, "iphone 14 pro": 2200, "iphone 14 pro max": 2500,
-    "iphone 15": 2100, "iphone 15 pro": 2800, "iphone 15 pro max": 3200,
+    "iphone 11 64": 650, "iphone 11 128": 750,
+    "iphone 12 mini": 780, "iphone 12 64": 920, "iphone 12 128": 1050, "iphone 12 pro": 1300,
+    "iphone 13 mini": 1150, "iphone 13 128": 1450, "iphone 13 pro": 1800, "iphone 13 pro max": 2050,
+    "iphone 14 128": 1800, "iphone 14 pro": 2300,
+    "iphone 15 128": 2200, "iphone 15 pro": 2850,
+    "iphone xr": 480, "iphone xs": 400, "iphone se 2020": 420, "iphone se 2022": 620,
     # Samsung
-    "samsung galaxy s20 fe": 450, "samsung galaxy s21": 650, "samsung galaxy s21 ultra": 1000,
-    "samsung galaxy s22": 950, "samsung galaxy s22 ultra": 1450, "samsung galaxy s23": 1400,
-    "samsung galaxy a52": 320, "samsung galaxy a53": 420, "samsung galaxy a54": 580, "samsung galaxy a55": 750,
-    # Xiaomi / POCO
-    "redmi note 10 pro": 280, "redmi note 11 pro": 380, "redmi note 12 pro": 490, "redmi note 13 pro": 650,
-    "poco x3 pro": 280, "poco x4 pro": 420, "poco x5 pro": 550, "poco x6 pro": 780,
-    "poco f3": 420, "poco f4": 560, "poco f5": 750,
-    # Google Pixel
-    "google pixel 6": 550, "google pixel 6a": 480, "google pixel 7": 750, "google pixel 7a": 680,
+    "s20 fe": 520, "s21 fe": 720, "s21 ultra": 1050, "s21": 800,
+    "s22": 1050, "s22 ultra": 1550, "s23": 1500, "s23 ultra": 2150,
+    "a52": 390, "a53": 490, "a54": 650, "a55": 820, "a34": 490, "a35": 620,
+    # Xiaomi / Poco
+    "redmi note 10 pro": 340, "redmi note 11 pro": 430, "redmi note 12 pro": 550, "redmi note 13 pro": 720,
+    "poco x3 pro": 300, "poco x4 pro": 440, "poco x5 pro": 590, "poco x6 pro": 820,
+    "poco f3": 460, "poco f4": 620, "poco f5": 870,
+    # Pixel & Others
+    "pixel 6a": 590, "pixel 6": 690, "pixel 7a": 800, "pixel 7": 990,
+    "honor 50": 430, "honor 70": 620, "honor 90": 800
 }
 
-CRITICAL_DEFECT_WORDS = [
-    "на запчасти", "под восстановление", "не включается", "кирпич", "утопленник", "залит",
-    "пароль", "icloud", "заблокирован", "байпас", "bypass", "mdm", "lost", "frp",
-    "mi аккаунт", "mi account", "huawei id", "knox", "лизинг", "рассрочк", "сплит",
-    "пятно на экране", "черное пятно", "полосы на экране", "зеленая полоса", "не работает сеть",
-    "отвал процессора", "bootloop", "вечный ребут", "перезагружается сам", "ldu", "demo unit"
+# Стоп-слова: критические дефекты и блокировки
+STRICT_STOP_WORDS = [
+    "icloud", "айклауд", "байпас", "bypass", "копия", "реплика", "фейк",
+    "frp", "google lock", "гугл аккаунт", "аккаунт гугл", "ми аккаунт", "mi account", 
+    "mi cloud", "ми клауд", "huawei id", "хуавей ид", "samsung account", "knox guard", 
+    "knox", "лизинг", "яндекс плюс", "сплит", "рассрочк", "заблокирован оператором", "sim lock",
+    "ldu", "live demo", "демо образец", "demo unit",
+    "на запчасти", "под восстановление", "не включается", "залит", "утопленник", 
+    "mdm", "демо", "не видит сеть", "без сети", "не звонит", "кирпич",
+    "отвал", "реболл", "bootloop", "бутлуп", "вечный ребут", "перезагружается сам", 
+    "зеленая полоса", "зеленые полосы", "полоса на экране", "черное пятно"
 ]
 
-NON_CRITICAL_DEFECT_WORDS = [
-    "царапины", "потертости", "потертость", "скол на корпусе", "трещина на задней",
-    "трещина задней", "акб 7", "акб 8", "батарея 7", "батарея 8", "трещина на защитном"
-]
+# Комплектация (не считается дефектом)
+KIT_NUANCES = {
+    "без коробк": "Без коробки",
+    "нет коробк": "Без коробки",
+    "коробка утеряна": "Без коробки",
+    "без комплект": "Только телефон",
+    "нет комплект": "Без комплекта",
+    "без зарядк": "Без блока питания",
+    "нет зарядк": "Без зарядного",
+    "без блок": "Без блока питания",
+    "без шнур": "Без кабеля",
+    "без провод": "Без провода",
+    "без чек": "Без документов",
+    "нет чек": "Без документов",
+    "только телефон": "Только сам телефон"
+}
 
-COMPLETION_MISSING_WORDS = [
-    "без коробки", "нет коробки", "коробка утеряна", "без зарядки",
-    "нет зарядки", "без блока", "без шнура", "только телефон", "без чека"
-]
+# Мелкие дефекты
+MINOR_DEFECTS = {
+    "акб": "Износ батареи / слабый АКБ",
+    "батаре": "Снижена емкость аккумулятора",
+    "трещина сзади": "Трещина на задней крышке",
+    "задней крышк": "Царапины/трещина крышки",
+    "царапин": "Следы использования / царапины",
+    "потертост": "Потертости корпуса",
+    "потёртост": "Потертости корпуса",
+    "скол": "Мелкие сколы",
+    "выгоран": "Выгорание AMOLED экрана"
+}
 
-DATA_FILE = "users_data.json"
-
-def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"users": {}, "seen_ids": []}
-
-def save_data(data: dict):
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.error(f"Ошибка сохранения БД: {e}")
-
-db = load_data()
-
-def parse_price_byn(ad: dict) -> float:
-    try:
-        price_usd = ad.get("price_usd", "0")
-        price_byn_raw = ad.get("price_byn", "0")
-        if price_byn_raw and int(price_byn_raw) > 0:
-            return float(price_byn_raw) / 100.0
-        return float(price_usd) / 100.0 * 3.27
-    except Exception:
-        return 0.0
-
-def detect_device_category(title: str, desc: str) -> str:
-    text = f"{title} {desc}".lower()
+def detect_brand(title: str, body: str) -> Tuple[str, bool]:
+    text = f"{title} {body}".lower()
     if any(k in text for k in ["iphone", "айфон", "apple", "ios"]):
-        return "apple"
-    return "android"
+        return "Apple (iOS)", False
 
-def extract_memory_config(text: str) -> str:
-    match = re.search(r"(\b\d{1,2}\s*[\/\+]\s*\d{2,4}\s*(?:gb|гб)?\b|\b(?:32|64|128|256|512|1024)\s*(?:gb|гб)\b)", text, re.I)
-    return match.group(0).upper().strip() if match else ""
+    android_brands = [
+        ("Samsung", ["samsung", "самсунг", "galaxy", "галакси"]),
+        ("Xiaomi / POCO", ["xiaomi", "сяоми", "redmi", "редми", "poco", "поко"]),
+        ("Google Pixel", ["pixel", "пиксель", "google"]),
+        ("Honor", ["honor", "хонор"]),
+        ("Huawei", ["huawei", "хуавей"]),
+        ("Realme", ["realme", "реалми"]),
+        ("Tecno", ["tecno", "текно"]),
+        ("Infinix", ["infinix", "инфиникс"]),
+        ("OnePlus", ["oneplus", "ванплас", "1+"]),
+        ("Nothing", ["nothing", "насинг"]),
+        ("Motorola", ["motorola", "моторола"]),
+        ("Vivo / iQOO", ["vivo", "виво", "iqoo"]),
+        ("Oppo", ["oppo", "оппо"])
+    ]
 
-def analyze_phone_offer(ad: dict) -> Optional[Dict[str, Any]]:
-    title = ad.get("subject", "")
-    desc = ad.get("body", "")
-    full_text = f"{title} {desc}".lower()
-    price = parse_price_byn(ad)
-    if price <= 0:
-        return None
+    for brand_name, keywords in android_brands:
+        if any(kw in text for kw in keywords):
+            return brand_name, True
 
-    for bad_word in CRITICAL_DEFECT_WORDS:
-        if bad_word in full_text:
-            return None
+    return "Android (Другой)", True
 
-    minor_defects = [w for w in NON_CRITICAL_DEFECT_WORDS if w in full_text]
-    missing_items = [w for w in COMPLETION_MISSING_WORDS if w in full_text]
+def extract_memory_info(text: str) -> Optional[str]:
+    combo = re.search(r'\b(\d{1,2})\s*[\/\+]\s*(\d{2,4})\s*(?:gb|гб)?\b', text, re.IGNORECASE)
+    if combo:
+        return f"{combo.group(1)}/{combo.group(2)} GB"
+    rom = re.search(r'\b(32|64|128|256|512|1024|1tb|1тб)\s*(?:gb|гб)?\b', text, re.IGNORECASE)
+    if rom:
+        return f"{rom.group(1).upper()} GB"
+    return None
 
-    matched_model = None
-    market_price = 0
-    for model_key, bench_price in PRICE_BENCHMARKS.items():
-        if model_key in full_text:
-            matched_model = model_key
-            market_price = bench_price
-            break
+def analyze_phone_text(title: str, body: str) -> dict:
+    full_text = f"{title} {body}".lower()
+    critical_triggers = [w for w in STRICT_STOP_WORDS if w in full_text]
+    
+    kit_details = []
+    for kit_key, kit_desc in KIT_NUANCES.items():
+        if kit_key in full_text and kit_desc not in kit_details:
+            kit_details.append(kit_desc)
 
-    is_profitable = False
-    margin = 0.0
-    discount_pct = 0.0
-    suspiciously_cheap = False
+    found_defects = []
+    for defect_key, defect_desc in MINOR_DEFECTS.items():
+        if defect_key in full_text and defect_desc not in found_defects:
+            found_defects.append(defect_desc)
 
-    if market_price > 0:
-        margin = market_price - price
-        discount_pct = (margin / market_price) * 100.0
-        if discount_pct >= 20.0 and margin >= 70.0:
-            is_profitable = True
-        if discount_pct >= 65.0:
-            suspiciously_cheap = True
-    else:
-        is_profitable = True
+    bat_match = re.search(r'(?:акб|батаре[яе]|емкость|ёмкость)\D*?(\d{2,3})\s*%', full_text)
+    battery_health = int(bat_match.group(1)) if bat_match else None
+    memory = extract_memory_info(f"{title} {body}")
+
+    is_dangerous = len(critical_triggers) > 0
+    has_minor_defects = len(found_defects) > 0 or (battery_health is not None and battery_health < 80)
 
     return {
-        "id": str(ad.get("ad_id", "")),
-        "title": title,
-        "price": price,
-        "link": ad.get("ad_link", ""),
-        "location": ad.get("account_parameters", [{}])[0].get("v", "Беларусь"),
-        "os_type": detect_device_category(title, desc),
-        "memory": extract_memory_config(f"{title} {desc}"),
-        "minor_defects": minor_defects,
-        "missing_items": missing_items,
-        "market_price": market_price,
-        "margin": margin,
-        "discount_pct": discount_pct,
-        "is_profitable": is_profitable,
-        "suspiciously_cheap": suspiciously_cheap
+        "is_safe": not is_dangerous,
+        "critical_reasons": critical_triggers,
+        "has_minor_defects": has_minor_defects,
+        "minor_defects": found_defects,
+        "kit_details": kit_details,
+        "battery_health": battery_health,
+        "memory": memory
     }
 
-async def fetch_kufar_phones() -> List[dict]:
-    url = "https://api.kufar.by/search-api/v2/search/rendered-paginated"
-    params = {
-        "cat": "17010",
-        "typ": "sell",
-        "size": "30",
-        "sort": "lst.d"
-    }
-    
-    headers = {
+def estimate_market_price(title: str) -> Optional[int]:
+    cleaned = title.lower()
+    for model_key, est_price in BENCHMARK_PRICES.items():
+        tokens = model_key.split()
+        if all(token in cleaned for token in tokens):
+            return est_price
+    return None
+
+# =====================================================================
+# ЗАПРОС К KUFAR API
+# =====================================================================
+class KufarScraper:
+    BASE_URL = "https://api.kufar.by/search-api/v2/search/rendered-paginated"
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         "Origin": "https://www.kufar.by",
-        "Referer": "https://www.kufar.by/",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
+        "Referer": "https://www.kufar.by/l/mobilnye-telefony",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache"
     }
 
+    async def fetch_latest_phones(self) -> List[dict]:
+        params = {
+            "cat": "17010",
+            "sort": "lst.d",
+            "size": "30",
+            "typ": "sell"
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(headers=self.HEADERS, timeout=timeout) as session:
+                async with session.get(self.BASE_URL, params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        ads = data.get("ads", [])
+                        logger.info(f"[KUFAR] Опрос успешен. Получено объявлений: {len(ads)}")
+                        return ads
+                    else:
+                        logger.warning(f"[KUFAR] Ответ сервера со статусом: {resp.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"[KUFAR] Ошибка запроса к API: {e}")
+            return []
+
+scraper = KufarScraper()
+
+def evaluate_deal(ad: dict) -> Optional[dict]:
+    ad_id = str(ad.get("ad_id", ""))
+    subject = ad.get("subject", "").strip()
+    body = ad.get("body", "").strip()
+    price_byn_raw = ad.get("price_byn", "0")
+    
     try:
-        # curl_cffi с отпечатком реального браузера chrome120
-        async with AsyncSession(impersonate="chrome120") as session:
-            resp = await session.get(url, params=params, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                ads = data.get("ads", [])
-                logger.info(f"[API] Успешный опрос. Получено объявлений: {len(ads)}")
-                return ads
-            else:
-                logger.warning(f"[API] Статус Kufar: {resp.status_code}")
-                return []
-    except Exception as e:
-        logger.error(f"[API] Ошибка запроса: {e}")
-        return []
+        val = float(price_byn_raw)
+        price_byn = val / 100.0 if val > 10000 else val
+    except (ValueError, TypeError):
+        return None
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else None
+    if price_byn < 35:
+        return None
+
+    analysis = analyze_phone_text(subject, body)
+    if not analysis["is_safe"]:
+        return None
+
+    brand_name, is_android = detect_brand(subject, body)
+    market_price = estimate_market_price(subject)
+    
+    discount_byn = 0
+    discount_pct = 0
+    if market_price and market_price > price_byn:
+        discount_byn = market_price - price_byn
+        discount_pct = int((discount_byn / market_price) * 100)
+    else:
+        market_price = None
+
+    ad_url = ad.get("ad_link", f"https://www.kufar.by/item/{ad_id}")
+    is_suspiciously_cheap = bool(market_price and (price_byn < market_price * 0.35))
+
+    return {
+        "ad_id": ad_id,
+        "title": subject,
+        "brand": brand_name,
+        "is_android": is_android,
+        "price_byn": price_byn,
+        "market_price": market_price,
+        "discount_byn": discount_byn,
+        "discount_pct": discount_pct,
+        "analysis": analysis,
+        "url": ad_url,
+        "is_suspiciously_cheap": is_suspiciously_cheap,
+        "body_preview": (body[:180] + "...") if len(body) > 180 else body
+    }
+
+# =====================================================================
+# ИНТЕРФЕЙС И КЛАВИАТУРЫ TELEGRAM
+# =====================================================================
 dp = Dispatcher()
+bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-def get_main_keyboard(user_id: str) -> InlineKeyboardMarkup:
-    u = db["users"].get(user_id, {"min_price": 80, "max_price": 700, "os_filter": "all", "allow_minor": True})
-    os_label = {"all": "🌐 Все", "android": "🤖 Только Android", "apple": "🍏 Только Apple"}.get(u.get("os_filter", "all"), "🌐 Все")
-    minor_label = "✅ Допустимы" if u.get("allow_minor", True) else "❌ Только идеал"
+# Проверка владельца бота
+def check_access(user_id: int) -> bool:
+    return user_id == ALLOWED_USER_ID
+
+def build_budget_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💰 Бюджет: {u['min_price']} - {u['max_price']} BYN", callback_data="change_budget")],
-        [InlineKeyboardButton(text=f"📱 ОС: {os_label}", callback_data="toggle_os")],
-        [InlineKeyboardButton(text=f"🔧 Мелкие следы: {minor_label}", callback_data="toggle_minor")],
-        [InlineKeyboardButton(text="🔍 Ручная проверка сейчас", callback_data="manual_check_btn")]
+        [
+            InlineKeyboardButton(text="💵 До 450 BYN (Бюджетники)", callback_data="set_budget_50_450"),
+            InlineKeyboardButton(text="💎 450 - 950 BYN (Топ-сегмент)", callback_data="set_budget_450_950"),
+        ],
+        [
+            InlineKeyboardButton(text="🚀 950 - 1900 BYN (Флагманы)", callback_data="set_budget_950_1900"),
+            InlineKeyboardButton(text="🔥 Без лимита (100 - 5000)", callback_data="set_budget_100_5000"),
+        ],
+        [
+            InlineKeyboardButton(text="🤖 Выбор ОС / Брендов", callback_data="choose_brands_menu"),
+            InlineKeyboardButton(text="⚙️ Мелкие дефекты: ВКЛ/ВЫКЛ", callback_data="toggle_defects"),
+        ],
+        [
+            InlineKeyboardButton(text="🔍 Проверить ленту сейчас", callback_data="manual_check_btn"),
+            InlineKeyboardButton(text="📊 Мой профиль", callback_data="show_profile"),
+        ]
+    ])
+
+def build_brands_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌐 Все телефоны (iOS + Android)", callback_data="set_brand_all")],
+        [InlineKeyboardButton(text="🤖 Только Android (Все бренды)", callback_data="set_brand_android")],
+        [InlineKeyboardButton(text="🍏 Только Apple (iPhone)", callback_data="set_brand_apple")],
+        [InlineKeyboardButton(text="🔙 Назад в меню", callback_data="back_to_main_menu")]
     ])
 
 @dp.message(Command("start"))
-async def cmd_start(msg: types.Message):
-    uid = str(msg.from_user.id)
-    if uid not in db["users"]:
-        db["users"][uid] = {"min_price": 80, "max_price": 700, "os_filter": "all", "allow_minor": True}
-        save_data(db)
-    await msg.answer("🔥 <b>Радар телефонов Kufar запущен!</b>\n\nМониторю объявления, отсекаю блокировки и считаю профит.", parse_mode="HTML", reply_markup=get_main_keyboard(uid))
-
-@dp.message(Command("check"))
-async def cmd_check(msg: types.Message):
-    await msg.answer("⏳ Опрашиваю Kufar...")
-    ads = await fetch_kufar_phones()
-    if ads:
-        await msg.answer(f"✅ Связь с Kufar отличная! Получено свежих объявлений: {len(ads)}")
-    else:
-        await msg.answer("⚠️ Kufar вернул пустой список или защитный блок. Попробуйте снова через пару минут.")
-
-@dp.callback_query(F.data == "manual_check_btn")
-async def cb_manual_check(callback: types.CallbackQuery):
-    await callback.answer("Запрашиваю Kufar...")
-    ads = await fetch_kufar_phones()
-    if ads:
-        await callback.message.answer(f"✅ Связь работает, получено: {len(ads)} объявлений.")
-    else:
-        await callback.message.answer("⚠️ Kufar пока не вернул данные. Попробуйте чуть позже.")
-
-@dp.callback_query(F.data == "toggle_os")
-async def cb_toggle_os(callback: types.CallbackQuery):
-    uid = str(callback.from_user.id)
-    u = db["users"].get(uid, {"min_price": 80, "max_price": 700, "os_filter": "all", "allow_minor": True})
-    states = ["all", "android", "apple"]
-    u["os_filter"] = states[(states.index(u.get("os_filter", "all")) + 1) % 3]
-    db["users"][uid] = u
-    save_data(db)
-    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(uid))
-    await callback.answer()
-
-@dp.callback_query(F.data == "toggle_minor")
-async def cb_toggle_minor(callback: types.CallbackQuery):
-    uid = str(callback.from_user.id)
-    u = db["users"].get(uid, {"min_price": 80, "max_price": 700, "os_filter": "all", "allow_minor": True})
-    u["allow_minor"] = not u.get("allow_minor", True)
-    db["users"][uid] = u
-    save_data(db)
-    await callback.message.edit_reply_markup(reply_markup=get_main_keyboard(uid))
-    await callback.answer()
-
-@dp.callback_query(F.data == "change_budget")
-async def cb_change_budget(callback: types.CallbackQuery):
-    await callback.message.answer("Для изменения диапазона цен отправьте команду:\n<code>/budget МИН МАКС</code>\nПример: <code>/budget 100 800</code>", parse_mode="HTML")
-    await callback.answer()
-
-@dp.message(Command("budget"))
-async def cmd_budget(msg: types.Message):
-    uid = str(msg.from_user.id)
-    parts = msg.text.strip().split()
-    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
-        p_min, p_max = int(parts[1]), int(parts[2])
-        u = db["users"].get(uid, {"min_price": 80, "max_price": 700, "os_filter": "all", "allow_minor": True})
-        u["min_price"] = min(p_min, p_max)
-        u["max_price"] = max(p_min, p_max)
-        db["users"][uid] = u
-        save_data(db)
-        await msg.answer(f"✅ Бюджет обновлен: <b>{u['min_price']} - {u['max_price']} BYN</b>", parse_mode="HTML", reply_markup=get_main_keyboard(uid))
-    else:
-        await msg.answer("⚠️ Формат: <code>/budget МИН МАКС</code>\nПример: <code>/budget 100 650</code>", parse_mode="HTML")
-
-async def monitor_kufar_loop():
-    logger.info("[WORKER] Фоновый процесс запущен.")
-    while True:
-        try:
-            ads = await fetch_kufar_phones()
-            new_found = 0
-            for ad in ads:
-                aid = str(ad.get("ad_id", ""))
-                if not aid or aid in db["seen_ids"]:
-                    continue
-
-                db["seen_ids"].append(aid)
-                new_found += 1
-                if len(db["seen_ids"]) > 3000:
-                    db["seen_ids"] = db["seen_ids"][-2000:]
-
-                analysis = analyze_phone_offer(ad)
-                if not analysis or not analysis["is_profitable"]:
-                    continue
-
-                for uid, prefs in db["users"].items():
-                    if not (prefs["min_price"] <= analysis["price"] <= prefs["max_price"]):
-                        continue
-                    if prefs["os_filter"] != "all" and prefs["os_filter"] != analysis["os_type"]:
-                        continue
-                    if not prefs["allow_minor"] and analysis["minor_defects"]:
-                        continue
-
-                    badge = "🚨 ПОДОЗРИТЕЛЬНО НИЗКАЯ ЦЕНА (ПРОВЕРЯЙТЕ ЛИЧНО!)" if analysis["suspiciously_cheap"] else "🔥 ВЫГОДНЫЙ ВАРИАНТ"
-                    market_info = f"📊 Рынок: ~{analysis['market_price']} BYN\n💰 Зазор: ~{analysis['margin']:.0f} BYN (-{analysis['discount_pct']:.0f}%)" if analysis["market_price"] > 0 else "📊 Рынок: индивидуальный"
-                    items_txt = f"\n📦 Комплект: {', '.join(analysis['missing_items'])} (повод сбить цену)" if analysis["missing_items"] else ""
-                    defects_txt = f"\n⚠️ Следы: {', '.join(analysis['minor_defects'])}" if analysis["minor_defects"] else ""
-
-                    text = (
-                        f"{badge}\n\n"
-                        f"📱 <b>{analysis['title']}</b>\n"
-                        f"💵 <b>Цена: {analysis['price']:.0f} BYN</b>\n"
-                        f"📍 Город: {analysis['location']}\n"
-                        f"{f'💾 Память: {analysis['memory']}' if analysis['memory'] else ''}\n"
-                        f"{market_info}{defects_txt}{items_txt}\n\n"
-                        f"🔗 <a href=\"{analysis['link']}\">Открыть на Kufar</a>"
-                    )
-
-                    try:
-                        await bot.send_message(chat_id=int(uid), text=text, parse_mode="HTML")
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки сообщения {uid}: {e}")
-
-            if new_found > 0:
-                save_data(db)
-        except Exception as e:
-            logger.error(f"Ошибка в цикле парсинга: {e}")
-
-        # Безопасная пауза от 75 до 90 секунд
-        await asyncio.sleep(75 + random.randint(5, 15))
-
-async def handle_ping(request):
-    return web.Response(text="Kufar Bot OK (200)")
-
-async def main():
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN не указан!")
+async def cmd_start(message: types.Message):
+    if not check_access(message.from_user.id):
+        await message.answer("⛔ Доступ ограничен. Это приватный бот.")
         return
 
+    user_id = message.from_user.id
+    user_data = db.get_or_create_user(user_id)
+    defects_txt = "РАЗРЕШЕНЫ" if user_data["allow_minor_defects"] else "ЗАПРЕЩЕНЫ (только идеал)"
+    welcome_text = (
+        "👋 <b>Добро пожаловать в Kufar Phone Radar!</b>\n\n"
+        "🔒 <i>Приватный режим активен: бот работает исключительно для вас.</i>\n\n"
+        "Бот непрерывно мониторит Куфар и находит телефоны <b>ниже рынка</b>.\n"
+        "🛡 <b>Защита:</b> отсекает блокировки (iCloud, FRP, Mi Account, Knox, рассрочки) и нерабочие устройства.\n"
+        "📦 <b>Комплектация:</b> телефоны без коробки или зарядки <b>проходят всегда</b> и отмечаются для торга!\n\n"
+        f"🎯 <b>Ваш текущий фильтр:</b>\n"
+        f"• Бюджет: <code>{user_data['min_budget']} - {user_data['max_budget']} BYN</code>\n"
+        f"• Платформа: <b>{user_data['brands']}</b>\n"
+        f"• Мелкие нюансы (АКБ/крышка): <b>{defects_txt}</b>\n\n"
+        "Настройте параметры кнопками ниже:"
+    )
+    await message.answer(welcome_text, reply_markup=build_budget_keyboard())
+
+@dp.message(Command("check"))
+async def cmd_check(message: types.Message):
+    if not check_access(message.from_user.id):
+        return
+    await message.answer("⏳ Запрашиваю свежие объявления с Kufar...")
+    ads = await scraper.fetch_latest_phones()
+    if ads:
+        await message.answer(f"✅ Kufar ответил штатно! Получено свежих объявлений: <b>{len(ads)}</b>.")
+    else:
+        await message.answer("⚠️ Kufar временно вернул пустой список или паузу. Повторите через минуту.")
+
+@dp.message(Command("budget"))
+async def cmd_set_custom_budget(message: types.Message):
+    if not check_access(message.from_user.id):
+        return
+    parts = message.text.strip().split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await message.answer("⚠️ Формат команды: <code>/budget МИН МАКС</code>\nПример: <code>/budget 100 650</code>")
+        return
+        
+    min_b, max_b = int(parts[1]), int(parts[2])
+    if min_b >= max_b:
+        await message.answer("⚠️ Минимальный бюджет должен быть меньше максимального!")
+        return
+
+    db.update_user_budget(message.from_user.id, min_b, max_b)
+    await message.answer(f"✅ <b>Бюджет обновлен:</b> от <b>{min_b} BYN</b> до <b>{max_b} BYN</b>.")
+
+@dp.callback_query(F.data.startswith("set_budget_"))
+async def callback_budget_preset(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+    _, _, min_str, max_str = callback.data.split("_")
+    min_b, max_b = int(min_str), int(max_str)
+    db.update_user_budget(callback.from_user.id, min_b, max_b)
+    await callback.answer(f"Бюджет: {min_b} - {max_b} BYN")
+    await callback.message.edit_text(
+        f"✅ <b>Установлен новый бюджет поиска:</b> <code>{min_b} - {max_b} BYN</code>",
+        reply_markup=build_budget_keyboard()
+    )
+
+@dp.callback_query(F.data == "manual_check_btn")
+async def callback_manual_check_btn(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+    await callback.answer("Опрашиваю Kufar...")
+    ads = await scraper.fetch_latest_phones()
+    seen = db.get_total_seen_count()
+    if ads:
+        await callback.message.answer(f"✅ Kufar активен! В ленте: <b>{len(ads)}</b> объявлений. Всего в памяти бота: <b>{seen}</b>.")
+    else:
+        await callback.message.answer("⚠️ Kufar пока не вернул данные. Попробуйте через пару минут.")
+
+@dp.callback_query(F.data == "toggle_defects")
+async def callback_toggle_defects(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+    user = db.get_or_create_user(callback.from_user.id)
+    new_state = 0 if user["allow_minor_defects"] == 1 else 1
+    db.update_user_defects(callback.from_user.id, new_state)
+    state_str = "РАЗРЕШЕНЫ (АКБ/крышка/следы)" if new_state else "ЗАПРЕЩЕНЫ (только идеал)"
+    await callback.answer(f"Мелкие нюансы: {state_str}")
+    await callback.message.edit_text(
+        f"⚙️ <b>Параметр обновлен!</b>\nДопуск нюансов: <b>{state_str}</b>.\n"
+        "<i>Телефоны без коробки или зарядки пропускаются всегда.</i>",
+        reply_markup=build_budget_keyboard()
+    )
+
+@dp.callback_query(F.data == "choose_brands_menu")
+async def callback_choose_brands_menu(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        await callback.answer("Доступ запрещен.", show_alert=True)
+        return
+    user = db.get_or_create_user(callback.from_user.id)
+    await callback.message.edit_text(
+        f"🤖 <b>Настройка брендов</b>\n\nСейчас отслеживаются: <b>{user['brands']}</b>\n\nВыберите категорию:",
+        reply_markup=build_brands_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "set_brand_all")
+async def callback_set_brand_all(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        return
+    db.update_user_brands(callback.from_user.id, "Все (iOS + Android)")
+    await callback.answer("Все платформы")
+    await callback.message.edit_text("✅ Ищем <b>ВСЕ</b> телефоны (iPhone и любые Android).", reply_markup=build_budget_keyboard())
+
+@dp.callback_query(F.data == "set_brand_android")
+async def callback_set_brand_android(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        return
+    db.update_user_brands(callback.from_user.id, "Только Android")
+    await callback.answer("Только Android")
+    await callback.message.edit_text("🤖 Ищем <b>ТОЛЬКО Android</b> (Samsung, Xiaomi, Poco, Pixel, Honor и др.).", reply_markup=build_budget_keyboard())
+
+@dp.callback_query(F.data == "set_brand_apple")
+async def callback_set_brand_apple(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        return
+    db.update_user_brands(callback.from_user.id, "Только Apple")
+    await callback.answer("Только Apple")
+    await callback.message.edit_text("🍏 Ищем <b>ТОЛЬКО Apple iPhone</b>.", reply_markup=build_budget_keyboard())
+
+@dp.callback_query(F.data == "back_to_main_menu")
+async def callback_back_to_main(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        return
+    await callback.message.edit_text("⚙️ <b>Панель управления поиском:</b>", reply_markup=build_budget_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data == "show_profile")
+async def callback_profile(callback: CallbackQuery):
+    if not check_access(callback.from_user.id):
+        return
+    user = db.get_or_create_user(callback.from_user.id)
+    seen = db.get_total_seen_count()
+    text = (
+        f"👤 <b>Ваш профиль (Владелец):</b>\n\n"
+        f"🆔 Ваш Telegram ID: <code>{user['user_id']}</code>\n"
+        f"💰 Бюджет: <code>{user['min_budget']} - {user['max_budget']} BYN</code>\n"
+        f"📱 Платформа: <b>{user['brands']}</b>\n"
+        f"🔧 Нюансы (АКБ/корпус): <code>{'Включены' if user['allow_minor_defects'] else 'Отключены'}</code>\n"
+        f"📦 Без коробки/зарядки: <b>РАЗРЕШЕНО ВСЕГДА</b>\n"
+        f"🗄 Просмотрено ботом: <b>{seen}</b> объявлений\n"
+        f"📡 Статус: <b>АКТИВЕН 24/7</b>"
+    )
+    await callback.message.answer(text, reply_markup=build_budget_keyboard())
+    await callback.answer()
+
+# =====================================================================
+# ФОРМИРОВАНИЕ И ОТПРАВКА УВЕДОМЛЕНИЙ
+# =====================================================================
+async def send_deal_notification(deal: dict, user_id: int):
+    title = deal["title"]
+    brand = deal["brand"]
+    price = deal["price_byn"]
+    market = deal["market_price"]
+    discount_byn = deal["discount_byn"]
+    discount_pct = deal["discount_pct"]
+    analysis = deal["analysis"]
+    url = deal["url"]
+    
+    badges = []
+    if deal["is_suspiciously_cheap"]:
+        badges.append("🚨 <b>ВНИМАНИЕ: Слишком низкая цена (риск предоплаты)! Только личная встреча!</b>")
+    
+    badges.append(f"🏷️ <b>Бренд:</b> {brand}")
+
+    if analysis.get("memory"):
+        badges.append(f"💾 <b>Память:</b> {analysis['memory']}")
+
+    if analysis.get("battery_health"):
+        badges.append(f"🔋 <b>АКБ:</b> {analysis['battery_health']}%")
+
+    if analysis.get("kit_details"):
+        kit_str = ", ".join(analysis["kit_details"])
+        badges.append(f"📦 <b>Комплектация:</b> {kit_str} (повод сбить цену на 20-40 BYN)")
+
+    if analysis["has_minor_defects"]:
+        defects_str = ", ".join(analysis["minor_defects"]) if analysis["minor_defects"] else "требует внимания"
+        badges.append(f"⚠️ <b>Нюансы:</b> {defects_str}")
+    else:
+        badges.append("✨ <b>Состояние:</b> Без критичных дефектов")
+
+    if market:
+        market_block = (
+            f"📈 <b>Ориентир рынка:</b> ~<code>{market} BYN</code>\n"
+            f"🎁 <b>Зазор / Профит:</b> ~<code>{discount_byn:.0f} BYN</code> (<b>-{discount_pct}%</b>)\n"
+        )
+    else:
+        market_block = "📈 <b>Рынок:</b> <i>Индивидуальная оценка</i>\n"
+
+    badges_formatted = "\n".join(badges)
+    card_text = (
+        f"🔥 <b>НАЙДЕН ТЕЛЕФОН В ВАШЕМ БЮДЖЕТЕ!</b>\n\n"
+        f"📱 <b>{title}</b>\n"
+        f"💵 <b>Цена продавца:</b> <code>{price:.0f} BYN</code>\n"
+        f"{market_block}"
+        f"{badges_formatted}\n\n"
+        f"📝 <b>Из описания:</b> <i>{deal['body_preview']}</i>\n"
+    )
+
+    action_buttons = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Открыть на Kufar", url=url)]
+    ])
+
+    try:
+        await bot.send_message(user_id, card_text, reply_markup=action_buttons, disable_web_page_preview=False)
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
+
+# =====================================================================
+# ФОНОВЫЙ ВОРКЕР МОНИТОРИНГА
+# =====================================================================
+async def background_monitoring_loop():
+    logger.info("Фоновый воркер запущен. Ожидание первого цикла...")
+    await asyncio.sleep(5)
+    
+    while True:
+        try:
+            raw_ads = await scraper.fetch_latest_phones()
+            active_users = db.get_active_users()
+            
+            if active_users and raw_ads:
+                for ad in raw_ads:
+                    ad_id = str(ad.get("ad_id", ""))
+                    if not ad_id or db.is_ad_seen(ad_id):
+                        continue
+                    
+                    deal = evaluate_deal(ad)
+                    db.mark_ad_seen(ad_id, float(ad.get("price_byn", 0)) / 100.0)
+
+                    if not deal:
+                        continue
+
+                    for user in active_users:
+                        user_id = user["user_id"]
+                        min_b = user["min_budget"]
+                        max_b = user["max_budget"]
+                        allow_defects = user["allow_minor_defects"]
+                        user_brands = user.get("brands", "Все")
+
+                        # Фильтр по цене
+                        if not (min_b <= deal["price_byn"] <= max_b):
+                            continue
+
+                        # Фильтр по платформе
+                        if user_brands == "Только Android" and not deal["is_android"]:
+                            continue
+                        if user_brands == "Только Apple" and deal["is_android"]:
+                            continue
+
+                        # Фильтр по нюансам (комплект без коробки/зарядки НЕ считается дефектом)
+                        if deal["analysis"]["has_minor_defects"] and not allow_defects:
+                            continue
+
+                        await send_deal_notification(deal, user_id)
+                        await asyncio.sleep(0.5)
+
+        except Exception as e:
+            logger.error(f"Ошибка в цикле мониторинга: {e}", exc_info=True)
+
+        # Безопасный интервал (75-90 секунд с рандомизацией)
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS + random.randint(3, 15))
+
+# =====================================================================
+# ВЕБ-СЕРВЕР ДЛЯ RENDER (HEALTH-CHECK)
+# =====================================================================
+async def handle_health_check(request: web.Request) -> web.Response:
+    return web.Response(text="Kufar Phone Radar is alive and running!", status=200)
+
+async def start_health_server():
     app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
+    app.router.add_get("/", handle_health_check)
+    app.router.add_get("/health", handle_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"Сервер health-check поднят на порту {PORT}")
+    logger.info(f"Health-check сервер запущен на порту {PORT}")
 
-    asyncio.create_task(monitor_kufar_loop())
+# =====================================================================
+# ТОЧКА ВХОДА
+# =====================================================================
+async def main():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("ОШИБКА: TELEGRAM_BOT_TOKEN не задан!")
+        return
+
+    logger.info(f"Запуск приватного бота для пользователя ID {ALLOWED_USER_ID}...")
+    await start_health_server()
+    asyncio.create_task(background_monitoring_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
